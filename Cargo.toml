@@ -1,11 +1,11 @@
 [package]
 name = "karlsen-miner"
-version = "3.1.0"
+version = "3.1.1"
 edition = "2021"
 license = "MIT/Apache-2.0"
 repository = "https://github.com/karlsen-network/karlsen-miner"
 readme = "README.md"
-description = "A fast CPU & GPU miner for Karlsen"
+description = "A fast GPU miner for Karlsen"
 categories = ["command-line-utilities"]
 keywords = ["blockchain", "cli"]
 include = [
@@ -21,7 +21,6 @@ include = [
 ]
 
 [dependencies]
-lazy_static = "1.4.0"
 tiny-keccak = { version = "2.0.2", features = ["keccak"] }
 blake3 = "1.5.0"
 tonic = "0.12"
@@ -29,7 +28,6 @@ tokio = { version = "1.28.0", features = ["macros", "rt-multi-thread"] }
 prost = "0.13.5"
 futures-util = "0.3"
 tokio-stream = {version = "0.1", features = ["net"]}
-once_cell = "1"
 num_cpus = "1"
 rand = "0.9"
 blake2b_simd = "1.0.0"
@@ -50,6 +48,8 @@ num = "0.4"
 nix = "0.25"
 hex = "0.4"
 time = { version = "0.3", features = ["formatting", "macros"] }
+tokio-native-tls = "0.3"
+native-tls = "0.2"
 
 [features]
 default = ["parking_lot"]
@@ -73,3 +73,6 @@ time = { version = "0.3", features = ["formatting"] }
 [workspace]
 members = ["plugins/*"]
 default-members = [".", "plugins/cuda"]
+
+[lints.clippy]
+uninlined_format_args = "allow"

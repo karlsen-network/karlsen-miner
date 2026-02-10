@@ -4,18 +4,15 @@ use std::time::{Duration, UNIX_EPOCH};
 use time::{macros::format_description, OffsetDateTime};
 
 pub use crate::pow::hasher::HeaderHasher;
-use crate::HashKls;
 use crate::{
     pow::hasher::Hasher,
     proto::{RpcBlock, RpcBlockHeader},
     target::{self, Uint256},
     Error, Hash,
 };
-use karlsen_hasher::{PowB3Hash, PowFishHash};
 use karlsen_miner::Worker;
 
 mod hasher;
-mod karlsen_hasher;
 
 #[derive(Clone, Debug)]
 pub enum BlockSeed {
@@ -60,8 +57,6 @@ pub struct State {
     pub target: Uint256,
     pub pow_hash_header: [u8; 72],
     block: Arc<BlockSeed>,
-    // PRE_POW_HASH || TIME || 32 zero byte padding; without NONCE
-    b3hasher: PowB3Hash,
     pub nonce_mask: u64,
     pub nonce_fixed: u64,
 }
@@ -109,71 +104,36 @@ impl State {
                 .concat()
                 .as_slice(),
         );
-        let b3hasher = PowB3Hash::new(HashKls(pre_pow_hash.to_le_bytes()), header_timestamp);
 
-        Ok(Self {
-            id,
-            target: header_target,
-            pow_hash_header,
-            block: Arc::new(block_seed),
-            b3hasher,
-            nonce_mask,
-            nonce_fixed,
-        })
+        Ok(Self { id, target: header_target, pow_hash_header, block: Arc::new(block_seed), nonce_mask, nonce_fixed })
     }
 
     #[inline(always)]
-    pub fn calculate_pow(&self, nonce: u64, use_dataset: bool) -> Uint256 {
-        // Step 1: PRE_POW_HASH || TIMESTAMP || padding || NONCE → Blake3
-
-        let hash: HashKls = self.b3hasher.clone().finalize_with_nonce(nonce);
-        //info!("HashKls1-1 = {:?}", hash);
-        let hash = PowFishHash::fishhashplus_kernel(&hash, use_dataset);
-        //info!("HashKls2 = {:?}", hash);
-        let hash = PowB3Hash::hash(hash);
-        //info!("HashKls3 = {:?}", hash);
-        // Step 4: Convert to Uint256 (little-endian)
-        Uint256::from_le_bytes(hash.as_bytes())
-    }
-
-    #[inline(always)]
-    pub fn check_pow(&self, nonce: u64, use_dataset: bool) -> bool {
-        let _pow = self.calculate_pow(nonce, use_dataset);
-        //let _pow = self.calculate_pow_khashv2plus(nonce);
-        if _pow <= self.target {
-            info!("Found a block with pow: {:x}", _pow);
-            info!("Target was: {:x}", self.target);
-        }
-        // The pow hash must be less or equal than the claimed target.
-        _pow <= self.target
-    }
-
-    #[inline(always)]
-    pub fn generate_block_if_pow(&self, nonce: u64, use_dataset: bool) -> Option<BlockSeed> {
-        self.check_pow(nonce, use_dataset).then(|| {
-            let mut block_seed = (*self.block).clone();
-            match block_seed {
-                BlockSeed::FullBlock(ref mut block) => {
-                    let header = block.header.as_mut().expect("We checked that a header exists on creation");
-                    header.nonce = nonce;
-                }
-                BlockSeed::PartialBlock { nonce: ref mut header_nonce, ref mut hash, .. } => {
-                    *header_nonce = nonce;
-                    *hash = Some(format!("{:x}", self.calculate_pow(nonce, use_dataset)))
-                }
+    pub fn generate_block_if_pow(&self, nonce: u64) -> Option<BlockSeed> {
+        // GPU has already verified the PoW, so we just generate the block
+        let mut block_seed = (*self.block).clone();
+        match block_seed {
+            BlockSeed::FullBlock(ref mut block) => {
+                let header = block.header.as_mut().expect("We checked that a header exists on creation");
+                header.nonce = nonce;
             }
-            block_seed
-        })
+            BlockSeed::PartialBlock { nonce: ref mut header_nonce, ref mut hash, .. } => {
+                *header_nonce = nonce;
+                // For partial blocks, we could calculate the hash here if needed for the pool
+                // but since GPU already verified it meets the target, we can leave it as None
+                // or calculate it only if the pool specifically requires it
+                *hash = None; // GPU already verified the PoW
+            }
+        }
+        Some(block_seed)
     }
 
     pub fn load_to_gpu(&self, gpu_work: &mut dyn Worker) {
-        //info!("load_to_gpu: debug1 ");
         gpu_work.load_block_constants(&self.pow_hash_header, &self.target.0);
     }
 
     #[inline(always)]
     pub fn pow_gpu(&self, gpu_work: &mut dyn Worker) {
-        //info!("pow_gpu: debug1 ");
         gpu_work.calculate_hash(None, self.nonce_mask, self.nonce_fixed);
     }
 }

@@ -10,7 +10,7 @@ jobs:
       fail-fast: false
       matrix:
         # Build gnu-linux on ubuntu-22.04 and musl on ubuntu latest
-        os: [ ubuntu-22.04, windows-latest, macos-latest ]
+        os: [ ubuntu-22.04, windows-latest ]
         features: [ "karlsencuda/overclock" ]
     name: Building, ${{ matrix.os }} ${{ matrix.features }}
     steps:
@@ -80,19 +80,6 @@ jobs:
           7z a -tzip -r ${asset_name}.zip ${asset_name}
           echo "archive=${asset_name}.zip" >> $GITHUB_ENV
           echo "asset_name=${asset_name}.zip" >> $GITHUB_ENV
-
-      - name: Build on MacOS
-        if: matrix.os == 'macos-latest'
-        run: |
-          rustup target add x86_64-apple-darwin
-          cargo build --target=x86_64-apple-darwin --release -p karlsen-miner
-          asset_name="karlsen-miner-${{ github.event.release.tag_name }}-cpu-only-osx-amd64"
-          mkdir ${asset_name}
-          mv ./target/x86_64-apple-darwin/release/karlsen-miner ${asset_name}/${asset_name}
-          tar czvf ${asset_name}.tgz ${asset_name}
-          echo "archive=${asset_name}.tgz" >> $GITHUB_ENV
-          echo "asset_name=${asset_name}.tgz" >> $GITHUB_ENV
-
 
       - name: Upload release asset
         uses: actions/upload-release-asset@v1

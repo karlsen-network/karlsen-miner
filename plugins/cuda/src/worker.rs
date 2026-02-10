@@ -14,13 +14,11 @@ use std::ops::BitXor;
 use std::sync::{Arc, Weak};
 use tiny_keccak::Hasher;
 
-static BPS: f32 = 0.5;
+static BPS: f32 = 1.0;
 
 static PTX_86: &str = include_str!("../resources/karlsen-cuda-sm86.ptx");
 static PTX_75: &str = include_str!("../resources/karlsen-cuda-sm75.ptx");
 static PTX_61: &str = include_str!("../resources/karlsen-cuda-sm61.ptx");
-static PTX_30: &str = include_str!("../resources/karlsen-cuda-sm30.ptx");
-static PTX_20: &str = include_str!("../resources/karlsen-cuda-sm20.ptx");
 
 pub struct Kernel<'kernel> {
     func: Arc<Function<'kernel>>,
@@ -85,26 +83,14 @@ pub union hash1024 {
 }
 
 const SIZE_U32: usize = std::mem::size_of::<u32>();
-#[allow(dead_code)]
-const SIZE_U64: usize = std::mem::size_of::<u64>();
 
 pub trait HashData {
     fn new() -> Self;
     fn as_bytes(&self) -> &[u8];
-    fn as_bytes_mut(&mut self) -> &mut [u8];
 
+    #[inline(always)]
     fn get_as_u32(&self, index: usize) -> u32 {
         u32::from_le_bytes(self.as_bytes()[index * SIZE_U32..index * SIZE_U32 + SIZE_U32].try_into().unwrap())
-    }
-
-    #[allow(dead_code)]
-    fn get_as_u64(&self, index: usize) -> u64 {
-        u64::from_le_bytes(self.as_bytes()[index * SIZE_U64..index * SIZE_U64 + SIZE_U64].try_into().unwrap())
-    }
-
-    #[allow(dead_code)]
-    fn set_as_u64(&mut self, index: usize, value: u64) {
-        self.as_bytes_mut()[index * SIZE_U64..index * SIZE_U64 + SIZE_U64].copy_from_slice(&value.to_le_bytes())
     }
 }
 
@@ -118,10 +104,6 @@ impl HashData for Hash256 {
 
     fn as_bytes(&self) -> &[u8] {
         &self.0
-    }
-
-    fn as_bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.0
     }
 }
 
@@ -144,22 +126,17 @@ impl HashData for Hash512 {
     fn as_bytes(&self) -> &[u8] {
         &self.0
     }
-
-    fn as_bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.0
-    }
 }
 
 impl BitXor<&Hash512> for &Hash512 {
     type Output = Hash512;
 
+    #[inline(always)]
     fn bitxor(self, rhs: &Hash512) -> Self::Output {
         let mut hash = Hash512::new();
-
         for i in 0..64 {
-            hash.0[i] = self.0[i] ^ rhs.0[i]
+            hash.0[i] = self.0[i] ^ rhs.0[i];
         }
-
         hash
     }
 }
@@ -183,24 +160,22 @@ impl HashData for Hash1024 {
     fn as_bytes(&self) -> &[u8] {
         &self.0
     }
-
-    fn as_bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.0
-    }
 }
 
 const LIGHT_CACHE_ROUNDS: i32 = 3;
-
 const LIGHT_CACHE_NUM_ITEMS: u32 = 1179641;
 const FULL_DATASET_NUM_ITEMS: u32 = 37748717;
-const SEED: Hash256 = Hash256([
-    0xeb, 0x01, 0x63, 0xae, 0xf2, 0xab, 0x1c, 0x5a, 0x66, 0x31, 0x0c, 0x1c, 0x14, 0xd6, 0x0f, 0x42, 0x55, 0xa9, 0xb3,
-    0x9b, 0x0e, 0xdf, 0x26, 0x53, 0x98, 0x44, 0xf1, 0x17, 0xad, 0x67, 0x21, 0x19,
-]);
+#[rustfmt::skip]
+const SEED: [u8; 32] = [
+    0xeb, 0x01, 0x63, 0xae, 0xf2, 0xab, 0x1c, 0x5a, 
+    0x66, 0x31, 0x0c, 0x1c, 0x14, 0xd6, 0x0f, 0x42, 
+    0x55, 0xa9, 0xb3, 0x9b, 0x0e, 0xdf, 0x26, 0x53, 
+    0x98, 0x44, 0xf1, 0x17, 0xad, 0x67, 0x21, 0x19,
+];
 
 pub struct CudaGPUWorker {
     // NOTE: The order is important! context must be closed last
-    heavy_hash_kernel: Kernel<'static>,
+    khashv2_kernel: Kernel<'static>,
     stream: Stream,
     start_event: Event,
     stop_event: Event,
@@ -234,7 +209,7 @@ impl Worker for CudaGPUWorker {
 
     #[inline(always)]
     fn calculate_hash(&mut self, _nonces: Option<&Vec<u64>>, nonce_mask: u64, nonce_fixed: u64) {
-        let func = &self.heavy_hash_kernel.func;
+        let func = &self.khashv2_kernel.func;
         let stream = &self.stream;
         let random: u8 = match self.random {
             NonceGenEnum::Lean => {
@@ -248,7 +223,7 @@ impl Worker for CudaGPUWorker {
         unsafe {
             launch!(
                 func<<<
-                    self.heavy_hash_kernel.grid_size, self.heavy_hash_kernel.block_size,
+                    self.khashv2_kernel.grid_size, self.khashv2_kernel.block_size,
                     0, stream
                 >>>(
                     nonce_mask,
@@ -299,9 +274,9 @@ pub fn keccak(out: &mut [u8], data: &[u8]) {
     hasher.finalize(out);
 }
 
-fn build_light_cache_cpu(cache: &mut [Hash512]) {
+fn build_light_cache_cpu(cache: &mut [Hash512], seed: [u8; 32]) {
     let mut item: Hash512 = Hash512::new();
-    keccak(&mut item.0, &SEED.0);
+    keccak(&mut item.0, &seed);
     cache[0] = item;
 
     for cache_item in cache.iter_mut().take(LIGHT_CACHE_NUM_ITEMS as usize).skip(1) {
@@ -405,16 +380,6 @@ impl CudaGPUWorker {
                 Arc::new(Module::from_ptx(PTX_61, &[ModuleJitOption::OptLevel(OptLevel::O4)]).inspect_err(|_e| {
                     error!("Error loading PTX. Make sure you have the updated driver for you devices");
                 })?);
-        } else if major >= 3 {
-            _module =
-                Arc::new(Module::from_ptx(PTX_30, &[ModuleJitOption::OptLevel(OptLevel::O4)]).inspect_err(|_e| {
-                    error!("Error loading PTX. Make sure you have the updated driver for you devices");
-                })?);
-        } else if major >= 2 {
-            _module =
-                Arc::new(Module::from_ptx(PTX_20, &[ModuleJitOption::OptLevel(OptLevel::O4)]).inspect_err(|_e| {
-                    error!("Error loading PTX. Make sure you have the updated driver for you devices");
-                })?);
         } else {
             return Err("Cuda compute version not supported".into());
         }
@@ -422,7 +387,7 @@ impl CudaGPUWorker {
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
         let mut light_cache = vec![Hash512::default(); LIGHT_CACHE_NUM_ITEMS.try_into().unwrap()];
-        build_light_cache_cpu(&mut light_cache);
+        build_light_cache_cpu(&mut light_cache, SEED);
         let cache2 = DeviceBuffer::<Hash512>::from_slice(&light_cache)?;
 
         // debug light cache
@@ -433,27 +398,29 @@ impl CudaGPUWorker {
         let mut dataset2 = DeviceBuffer::<Hash1024>::zeroed(FULL_DATASET_NUM_ITEMS.try_into().unwrap())?;
         build_dataset_gpu(&mut dataset2, &cache2, &_module, &stream)?;
 
+        /*
         // debug dataset
         let mut host_dataset = vec![Hash1024::default(); FULL_DATASET_NUM_ITEMS.try_into().unwrap()];
         dataset2.copy_to(&mut host_dataset)?;
         info!("dataset[10] : {:x?}", host_dataset[10].0);
         info!("dataset[42] : {:x?}", host_dataset[42].0);
         info!("dataset[12345] : {:x?}", host_dataset[12345].0);
+        */
 
-        let mut heavy_hash_kernel = Kernel::new(Arc::downgrade(&_module), "heavy_hash")?;
+        let mut khashv2_kernel = Kernel::new(Arc::downgrade(&_module), "khashv2_kernel")?;
 
         let mut chosen_workload = 0u32;
         if is_absolute {
             chosen_workload = 1;
         } else {
-            let cur_workload = heavy_hash_kernel.get_workload();
+            let cur_workload = khashv2_kernel.get_workload();
             if chosen_workload == 0 || chosen_workload < cur_workload {
                 chosen_workload = cur_workload;
             }
         }
         chosen_workload = (chosen_workload as f32 * workload) as u32;
         info!("GPU #{} Chosen workload: {}", device_id, chosen_workload);
-        heavy_hash_kernel.set_workload(chosen_workload);
+        khashv2_kernel.set_workload(chosen_workload);
 
         let final_nonce_buff = vec![0u64; 1].as_slice().as_dbuf()?;
 
@@ -495,7 +462,7 @@ impl CudaGPUWorker {
             final_nonce_buff,
             cache2,
             dataset2,
-            heavy_hash_kernel,
+            khashv2_kernel,
             random,
         })
     }

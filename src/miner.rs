@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::num::Wrapping;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
@@ -7,7 +6,6 @@ use std::time::Duration;
 
 use crate::{pow, watch, Error};
 use log::{error, info, warn};
-use rand::{rng, RngCore};
 use tokio::sync::mpsc::Sender;
 use tokio::task::{self, JoinHandle};
 use tokio::time::MissedTickBehavior;
@@ -123,32 +121,28 @@ impl Drop for MinerManager {
     }
 }
 
-pub fn get_num_cpus(n_cpus: Option<u16>) -> u16 {
-    n_cpus.unwrap_or_else(|| {
-        num_cpus::get_physical().try_into().expect("Doesn't make sense to have more than 65,536 CPU cores")
-    })
-}
-
 const LOG_RATE: Duration = Duration::from_secs(30);
 
 impl MinerManager {
-    pub fn new(send_channel: Sender<BlockSeed>, n_cpus: Option<u16>, manager: &PluginManager) -> Self {
+    pub fn new(send_channel: Sender<BlockSeed>, manager: &PluginManager) -> Self {
         register_freeze_handler();
         let hashes_tried = Arc::new(AtomicU64::new(0));
         let hashes_by_worker = Arc::new(Mutex::new(HashMap::<String, Arc<AtomicU64>>::new()));
         let (send, recv) = watch::channel(None);
-        let mut handles =
-            Self::launch_cpu_threads(send_channel.clone(), Arc::clone(&hashes_tried), recv.clone(), n_cpus)
-                .collect::<Vec<MinerHandler>>();
-        if manager.has_specs() {
-            handles.append(&mut Self::launch_gpu_threads(
+
+        let handles = if manager.has_specs() {
+            Self::launch_gpu_threads(
                 send_channel.clone(),
                 Arc::clone(&hashes_tried),
                 recv,
                 manager,
                 hashes_by_worker.clone(),
-            ));
-        }
+            )
+        } else {
+            warn!("No GPU specs available, no miners will be launched");
+            Vec::new()
+        };
+
         Self {
             handles,
             block_channel: send,
@@ -159,18 +153,6 @@ impl MinerManager {
             current_state_id: AtomicUsize::new(0),
             hashes_by_worker,
         }
-    }
-
-    fn launch_cpu_threads(
-        send_channel: Sender<BlockSeed>,
-        hashes_tried: Arc<AtomicU64>,
-        work_channel: watch::Receiver<Option<WorkerCommand>>,
-        n_cpus: Option<u16>,
-    ) -> impl Iterator<Item = MinerHandler> {
-        let n_cpus = get_num_cpus(n_cpus);
-        info!("launching: {} cpu miners", n_cpus);
-        (0..n_cpus)
-            .map(move |_| Self::launch_cpu_miner(send_channel.clone(), work_channel.clone(), Arc::clone(&hashes_tried)))
     }
 
     fn launch_gpu_threads(
@@ -240,7 +222,9 @@ impl MinerManager {
                         state = match block_channel.wait_for_change() {
                             Ok(cmd) => match cmd {
                                 Some(WorkerCommand::Job(s)) => Some(s),
-                                Some(WorkerCommand::Close) => {return Ok(());}
+                                Some(WorkerCommand::Close) => {
+                                    return Ok(());
+                                }
                                 None => None,
                             },
                             Err(e) => {
@@ -253,18 +237,18 @@ impl MinerManager {
                         Some(s) => {
                             s.load_to_gpu(gpu_work);
                             s
-                        },
+                        }
                         None => continue,
                     };
                     state_ref.pow_gpu(gpu_work);
                     if let Err(e) = gpu_work.sync() {
                         warn!("CUDA run ignored: {}", e);
-                        continue
+                        continue;
                     }
 
                     gpu_work.copy_output_to(&mut nonces)?;
                     if nonces[0] != 0 {
-                        if let Some(block_seed) = state_ref.generate_block_if_pow(nonces[0], false) {
+                        if let Some(block_seed) = state_ref.generate_block_if_pow(nonces[0]) {
                             match send_channel.blocking_send(block_seed.clone()) {
                                 Ok(()) => block_seed.report_block(),
                                 Err(e) => error!("Failed submitting block: ({})", e),
@@ -274,11 +258,13 @@ impl MinerManager {
                             }
                             nonces[0] = 0;
                             hashes_tried.fetch_add(gpu_work.get_workload().try_into().unwrap(), Ordering::AcqRel);
-                            worker_hashes_tried.fetch_add(gpu_work.get_workload().try_into().unwrap(), Ordering::AcqRel);
+                            worker_hashes_tried
+                                .fetch_add(gpu_work.get_workload().try_into().unwrap(), Ordering::AcqRel);
                             continue;
                         } else {
-                            let hash = state_ref.calculate_pow(nonces[0], false);
-                            warn!("Something is wrong in GPU results! Got nonce {}, with hash real {:?}  (target: {}*2^196)", nonces[0], hash.0, state_ref.target.0[3]);
+                            // GPU returned a nonce but it didn't meet the target
+                            // This shouldn't happen if the GPU kernel is working correctly
+                            warn!("GPU returned invalid nonce {}! Target: {}*2^196", nonces[0], state_ref.target.0[3]);
                             break;
                         }
                     }
@@ -289,7 +275,9 @@ impl MinerManager {
                         if let Some(new_cmd) = block_channel.get_changed()? {
                             state = match new_cmd {
                                 Some(WorkerCommand::Job(s)) => Some(s),
-                                Some(WorkerCommand::Close) => {return Ok(());}
+                                Some(WorkerCommand::Close) => {
+                                    return Ok(());
+                                }
                                 None => None,
                             };
                         }
@@ -299,78 +287,6 @@ impl MinerManager {
             })()
             .inspect_err(|e: &Error| {
                 error!("{}: GPU thread crashed: {}", gpu_work.id(), e);
-            })
-        })
-    }
-
-    #[allow(unreachable_code)]
-    fn launch_cpu_miner(
-        send_channel: Sender<BlockSeed>,
-        mut block_channel: watch::Receiver<Option<WorkerCommand>>,
-        hashes_tried: Arc<AtomicU64>,
-    ) -> MinerHandler {
-        let mut nonce = Wrapping(rng().next_u64());
-        let mut mask = Wrapping(0);
-        let mut fixed = Wrapping(0);
-        std::thread::spawn(move || {
-            (|| {
-                let mut state = None;
-
-                loop {
-                    if state.is_none() {
-                        state = match block_channel.wait_for_change() {
-                            Ok(cmd) => match cmd {
-                                Some(WorkerCommand::Job(s)) => Some(s),
-                                Some(WorkerCommand::Close) => {
-                                    return Ok(());
-                                }
-                                None => None,
-                            },
-                            Err(e) => {
-                                info!("CPU thread crashed: {}", e);
-                                return Ok(());
-                            }
-                        };
-                        if let Some(s) = &state {
-                            mask = Wrapping(s.nonce_mask);
-                            fixed = Wrapping(s.nonce_fixed);
-                        }
-                    }
-                    let state_ref = match state.as_mut() {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    nonce = (nonce & mask) | fixed;
-
-                    if let Some(block_seed) = state_ref.generate_block_if_pow(nonce.0, true) {
-                        match send_channel.blocking_send(block_seed.clone()) {
-                            Ok(()) => block_seed.report_block(),
-                            Err(e) => error!("Failed submitting block: ({})", e),
-                        };
-                        if let BlockSeed::FullBlock(_) = block_seed {
-                            state = None;
-                        }
-                    }
-                    nonce += Wrapping(1);
-                    // TODO: Is this really necessary? can we just use Relaxed?
-                    hashes_tried.fetch_add(1, Ordering::AcqRel);
-
-                    if nonce.0 % 128 == 0 {
-                        if let Some(new_cmd) = block_channel.get_changed()? {
-                            state = match new_cmd {
-                                Some(WorkerCommand::Job(s)) => Some(s),
-                                Some(WorkerCommand::Close) => {
-                                    return Ok(());
-                                }
-                                None => None,
-                            };
-                        }
-                    }
-                }
-                Ok(())
-            })()
-            .inspect_err(|e: &Error| {
-                error!("CPU thread crashed: {}", e);
             })
         })
     }
@@ -385,12 +301,12 @@ impl MinerManager {
             Self::log_single_hashrate(
                 &hashes_tried,
                 "Current hashrate is".into(),
-                "Workers stalled or crashed. Consider reducing workload and check that your node is synced. If this is the first time starting the miner, DAG generation can take up to a few minutes and the miner will begin hashing after that.",
+                "GPU workers stalled or crashed. Consider reducing workload and check that your node is synced.",
                 duration,
                 false,
             );
             for (device, rate) in &*hashes_by_worker.lock().unwrap() {
-                Self::log_single_hashrate(rate, format!("Device {}:", device), "0 hash/s", duration, true);
+                Self::log_single_hashrate(rate, format!("GPU Device {}:", device), "0 hash/s", duration, true);
             }
             last_instant = now;
         }

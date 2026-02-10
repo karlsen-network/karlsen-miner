@@ -12,7 +12,7 @@ log = "0.4"
 rand = "0.8"
 clap = { version = "3.0", features = ["color", "derive"]}
 env_logger = "0.9"
-nvml-wrapper = { git = "https://github.com/benrod3k/nvml-wrapper", branch = "495.29.05", optional = true }
+nvml-wrapper = { version = "0.11.0", optional = true }
 tiny-keccak = { version = "2.0.2", features = ["keccak"] }
 memmap = "0.7.0"
 
@@ -21,3 +21,6 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 overclock = [ "nvml-wrapper" ]
+
+[lints.clippy]
+uninlined_format_args = "allow"

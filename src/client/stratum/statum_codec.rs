@@ -32,7 +32,12 @@ impl Display for ErrorCode {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct StratumError(pub(crate) ErrorCode, pub(crate) String, #[serde(default)] pub(crate) Option<Value>);
+pub(crate) struct StratumError {
+    pub(crate) code: ErrorCode,
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) data: Option<Value>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
@@ -89,7 +94,7 @@ pub(crate) enum StratumCommand {
 pub(crate) enum StratumResult {
     Plain(Option<bool>),
     Eth((bool, String)),
-    Subscribe((Vec<(String, String)>, String, u32)),
+    Subscribe((Option<Vec<(String, String)>>, String, u32)),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -112,28 +117,34 @@ pub(crate) struct StratumLine {
 /// An error occurred while encoding or decoding a line.
 #[derive(Debug)]
 pub(crate) enum NewLineJsonCodecError {
-    JsonParseError(()),
+    JsonParseError(String),
     JsonEncodeError,
     LineSplitError,
     LineEncodeError,
-    Io(()),
+    Io(String),
 }
 
 impl fmt::Display for NewLineJsonCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Some error occured")
+        match self {
+            NewLineJsonCodecError::JsonParseError(msg) => write!(f, "JSON parse error: {}", msg),
+            NewLineJsonCodecError::JsonEncodeError => write!(f, "JSON encoding failed"),
+            NewLineJsonCodecError::LineSplitError => write!(f, "Line splitting failed"),
+            NewLineJsonCodecError::LineEncodeError => write!(f, "Line encoding failed"),
+            NewLineJsonCodecError::Io(msg) => write!(f, "IO error: {}", msg),
+        }
     }
 }
 impl From<io::Error> for NewLineJsonCodecError {
-    fn from(_: io::Error) -> NewLineJsonCodecError {
-        NewLineJsonCodecError::Io(())
+    fn from(e: io::Error) -> NewLineJsonCodecError {
+        NewLineJsonCodecError::Io(e.to_string())
     }
 }
 impl std::error::Error for NewLineJsonCodecError {}
 
 impl From<(String, String)> for NewLineJsonCodecError {
-    fn from(_: (String, String)) -> Self {
-        NewLineJsonCodecError::JsonParseError(())
+    fn from((error, _line): (String, String)) -> Self {
+        NewLineJsonCodecError::JsonParseError(error)
     }
 }
 
@@ -152,6 +163,11 @@ impl Decoder for NewLineJsonCodec {
     type Error = NewLineJsonCodecError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        /*
+        if !src.is_empty() {
+            info!("stratum received: {:?}", String::from_utf8_lossy(src));
+        }
+        */
         match self.lines_codec.decode(src) {
             Ok(Some(s)) => {
                 serde_json::from_str::<StratumLine>(s.as_str()).map_err(|e| (e.to_string(), s).into()).map(Some)

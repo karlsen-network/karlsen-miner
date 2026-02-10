@@ -1,4 +1,5 @@
 use futures::prelude::*;
+use native_tls::TlsConnector as NativeTlsConnector;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::pin::Pin;
@@ -6,6 +7,7 @@ use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio_native_tls::TlsConnector;
 use tokio_util::codec::Framed;
 
 mod statum_codec;
@@ -154,12 +156,15 @@ impl Client for StratumHandler {
         info!("Waiting for stuff");
         loop {
             {
-                if (!self.mining_dev.unwrap_or(true)
-                    && self.block_template_ctr.load(Ordering::SeqCst) <= self.devfund_percent)
-                    || (self.mining_dev.unwrap_or(false)
-                        && self.block_template_ctr.load(Ordering::SeqCst) > self.devfund_percent)
-                {
-                    return Ok(());
+                if self.devfund_percent > 0 {
+                    let block_count = self.block_template_ctr.load(Ordering::SeqCst);
+                    let mining_dev = self.mining_dev.unwrap_or(true);
+
+                    match (mining_dev, block_count <= self.devfund_percent) {
+                        (false, true) => return Ok(()), // not mining dev but under threshold
+                        (true, false) => return Ok(()), // mining dev but over threshold
+                        _ => {}                         // continue mining
+                    }
                 }
             }
             match self.stream.try_next().await? {
@@ -180,14 +185,33 @@ impl StratumHandler {
         miner_address: String,
         mine_when_not_synced: bool,
         block_template_ctr: Option<Arc<AtomicU16>>,
+        use_ssl: bool,
     ) -> Result<Box<Self>, Error> {
         info!("Connecting to {}", address);
-        let socket = TcpStream::connect(address).await?;
+        let socket = TcpStream::connect(&address).await?;
 
-        let client = Framed::new(socket, NewLineJsonCodec::new());
         let (send_channel, recv) = mpsc::channel::<StratumLine>(3);
-        let (sink, stream) = client.split();
-        tokio::spawn(async move { ReceiverStream::new(recv).map(Ok).forward(sink).await });
+
+        let stream: Pin<Box<dyn Stream<Item = Result<StratumLine, NewLineJsonCodecError>>>> = if use_ssl {
+            info!("Using SSL connection");
+            let connector = TlsConnector::from(
+                NativeTlsConnector::builder()
+                    .danger_accept_invalid_certs(true)
+                    .danger_accept_invalid_hostnames(true)
+                    .build()?,
+            );
+            let tls_stream = connector.connect("", socket).await?;
+            let client = Framed::new(tls_stream, NewLineJsonCodec::new());
+            let (sink, stream) = client.split();
+            tokio::spawn(async move { ReceiverStream::new(recv).map(Ok).forward(sink).await });
+            Box::pin(stream)
+        } else {
+            info!("Using TCP connection");
+            let client = Framed::new(socket, NewLineJsonCodec::new());
+            let (sink, stream) = client.split();
+            tokio::spawn(async move { ReceiverStream::new(recv).map(Ok).forward(sink).await });
+            Box::pin(stream)
+        };
 
         let share_state = unsafe {
             #[allow(static_mut_refs)]
@@ -206,7 +230,7 @@ impl StratumHandler {
         );
         Ok(Box::new(Self {
             log_handler: task::spawn(Self::log_shares(share_state.clone())),
-            stream: Box::pin(stream),
+            stream,
             send_channel,
             miner_address,
             mine_when_not_synced,
@@ -336,7 +360,7 @@ impl StratumHandler {
             StratumLine {
                 id: Some(id),
                 payload: StratumLinePayload::StratumResult { .. },
-                error: Some(StratumError(code, error, _)),
+                error: Some(StratumError { code, message: error, .. }),
                 ..
             } => {
                 let jobid = { self.shares_stats.shares_pending.try_lock().unwrap().remove(&id) }.unwrap();
